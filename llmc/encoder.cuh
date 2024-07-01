@@ -107,8 +107,11 @@ __global__ void wte_backward_kernel(floatX* dwte,
 
     // Add the result to dwte and write back to global memory (read-modify-write)
     for (unsigned int k = 0; k < x128::size; k++) {
-        // We use stochastic rounding to go from FP32 to BF16 but the seed should be deterministic
-        stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
+        // We use stochastic rounding to go from FP32 to BF16
+        // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
+        // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
+        // and that somehow messing the quality of random numbers
+        stochastic_rounding(accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + bucket * WARP_SIZE + threadIdx.x + k);
     }
     store128(dwte_ix, packed_in_out);
 }
@@ -139,8 +142,11 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
     floatX* dwpe_tc = dwpe + (t * C) + c;
     x128 packed_dwpe = load128(dwpe_tc);
     for (unsigned int k = 0; k < x128::size; k++) {
-        // We use stochastic rounding to go from FP32 to BF16 but the seed should be deterministic
-        stochastic_rounding(accum[k] + (float)packed_dwpe[k], &packed_dwpe[k], seed + k);
+        // We use stochastic rounding to go from FP32 to BF16
+        // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
+        // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
+        // and that somehow messing the quality of random numbers
+        stochastic_rounding(accum[k] + (float)packed_dwpe[k], &packed_dwpe[k], seed + idx + k);
     }
     store128(dwpe_tc, packed_dwpe);
 }
@@ -150,12 +156,12 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
 
 void encoder_forward(floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
-                     int B, int T, int C) {
+                     int B, int T, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    encoder_forward_kernel3<<<grid_size, block_size>>>(out, inp, wte, wpe, B, T, C);
+    encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -163,14 +169,14 @@ void encoder_forward(floatX* out,
 void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
                       int* workload_indices, int4* bucket_info,    // cpu scratch buffers
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
-                      int B, int T, int C, unsigned int seed) {
+                      int B, int T, int C, unsigned int seed, cudaStream_t stream) {
     NVTX_RANGE_FN();
 
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
     const int block_size = 256;
     const int N = T * C / x128::size;
     const int grid_size = CEIL_DIV(N, block_size);
-    wpe_backward_kernel<<<grid_size, block_size, 0>>>(dwpe, dout, inp, B, T, C, seed);
+    wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
     cudaCheck(cudaGetLastError());
 
     // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
@@ -218,11 +224,11 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
     // todo - could use CUDA events (even without streams) to avoid CPU/GPU synchronisation completely
     int4* d_bucket_info = (int4*)scratch;
     int*  d_workload_indices = (int*)(scratch + B*T*num_c_groups * sizeof(int4));
-    cudaCheck(cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice, stream));
+    cudaCheck(cudaMemcpyAsync(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     // Launch wte kernel
     // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
-    wte_backward_kernel<256><<<num_buckets, 256>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
+    wte_backward_kernel<256><<<num_buckets, 256, 0, stream>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
     cudaCheck(cudaGetLastError());
 }
